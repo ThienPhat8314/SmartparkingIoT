@@ -1,0 +1,5 @@
+{
+  "name": "Hệ Thống Quản Lý Bãi Đỗ Xe Thông Minh",
+  "description": "Một ứng dụng web thời gian thực để giám sát và quản lý bãi đỗ xe thông minh. Cung cấp giao diện cho cả người xem công khai và quản trị viên, với khả năng chuyển đổi giữa giao diện di động và web.",
+  "requestFramePermissions": []
+}
