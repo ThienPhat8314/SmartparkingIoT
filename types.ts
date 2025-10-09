@@ -61,3 +61,4 @@ export interface FeeSettings {
 
 export type ViewMode = 'mobile' | 'web';
 export type Theme = 'light' | 'dark';
+export type UpdateMode = 'realtime' | 'delayed' | 'manual';

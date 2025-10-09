@@ -1,9 +1,8 @@
 
-import React, { useState, useEffect, useContext, createContext, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useContext, createContext, useCallback, useMemo, useRef } from 'react';
 import { HashRouter, Routes, Route, Link, NavLink, useNavigate, useLocation, Navigate } from 'react-router-dom';
-import type { Spot, Session, Device, Summary, FirebaseConfig, User, ViewMode, Theme, FeeSettings } from './types';
+import type { Spot, Session, Device, Summary, FirebaseConfig, User, ViewMode, Theme, FeeSettings, UpdateMode } from './types';
 import { HomeIcon, CarIcon, HistoryIcon, ChartIcon, SearchIcon, SettingsIcon, ServerIcon, SunIcon, MoonIcon, MonitorIcon, SmartphoneIcon, LogInIcon, LogOutIcon, CheckCircleIcon, XCircleIcon, AlertTriangleIcon, LockIcon, RefreshIcon, SlidersIcon, TrashIcon, DownloadIcon, MenuIcon } from './components/Icons';
-
 
 // --- HELPERS ---
 const getFeeSettings = (): FeeSettings => {
@@ -141,19 +140,33 @@ interface FirebaseContextType {
     isConfigured: boolean;
     config: FirebaseConfig | null;
     setConfig: (config: FirebaseConfig | null, save: boolean) => void;
-    data: MockData;
+    data: MockData; // This will be clientData
     loading: boolean;
     error: string | null;
     testConnection: () => Promise<{ firebase: boolean; device: boolean; web: boolean }>;
     updateMockData: (updates: Partial<MockData>) => void;
     resetMockData: () => void;
+    // New properties for real-time control
+    updateMode: UpdateMode;
+    setUpdateMode: (mode: UpdateMode) => void;
+    isUpdateAvailable: boolean;
+    fetchLatestData: () => void;
 }
 const FirebaseContext = createContext<FirebaseContextType | null>(null);
+
+interface CameraContextType {
+    camInUrl: string;
+    camOutUrl: string;
+    setCamInUrl: (url: string) => void;
+    setCamOutUrl: (url: string) => void;
+}
+const CameraContext = createContext<CameraContextType | null>(null);
 
 // --- HOOKS ---
 const useUI = () => useContext(UIContext)!;
 const useAuth = () => useContext(AuthContext)!;
 const useFirebase = () => useContext(FirebaseContext)!;
+const useCamera = () => useContext(CameraContext)!;
 
 
 // --- PROVIDERS ---
@@ -245,72 +258,169 @@ const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => 
 };
 
 const FirebaseProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+    // --- State ---
     const [config, setConfigState] = useState<FirebaseConfig | null>(null);
+    const [updateMode, setUpdateModeState] = useState<UpdateMode>(() => (localStorage.getItem('updateMode') as UpdateMode) || 'realtime');
+
+    // "Server" state (source of truth) vs "Client" state (what viewers see)
     const [originalData, setOriginalData] = useState(() => generateMockData());
-    const [data, setData] = useState<MockData>(originalData);
+    const [serverData, setServerData] = useState<MockData>(originalData);
+    const [clientData, setClientData] = useState<MockData>(originalData);
+
+    const [isUpdateAvailable, setIsUpdateAvailable] = useState(false);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const isInitialMount = useRef(true);
+    const delayTimerRef = useRef<number | null>(null);
 
+    // --- Effects ---
     useEffect(() => {
         const storedConfig = localStorage.getItem('firebaseConfig');
         if (storedConfig) {
             setConfigState(JSON.parse(storedConfig));
         }
     }, []);
+    
+    useEffect(() => {
+        localStorage.setItem('updateMode', updateMode);
+    }, [updateMode]);
+    
+    useEffect(() => {
+        if (!config) {
+            const newData = generateMockData();
+            setOriginalData(newData);
+            setServerData(newData);
+            setClientData(newData);
+        }
+    }, [config]);
 
+    // Main sync logic: server -> client
+    useEffect(() => {
+        if (isInitialMount.current) {
+            isInitialMount.current = false;
+            return;
+        }
+
+        if (JSON.stringify(serverData) === JSON.stringify(clientData)) {
+            return;
+        }
+
+        if (delayTimerRef.current) {
+            clearTimeout(delayTimerRef.current);
+        }
+
+        if (updateMode === 'realtime') {
+            setClientData(serverData);
+            setIsUpdateAvailable(false);
+        } else if (updateMode === 'delayed') {
+            delayTimerRef.current = window.setTimeout(() => {
+                setClientData(serverData);
+                setIsUpdateAvailable(false);
+            }, 3000); // 3-second delay
+        } else if (updateMode === 'manual') {
+            setIsUpdateAvailable(true);
+        }
+    }, [serverData]);
+
+    // --- Functions ---
     const setConfig = (newConfig: FirebaseConfig | null, save: boolean) => {
         setConfigState(newConfig);
         if (save && newConfig) {
             localStorage.setItem('firebaseConfig', JSON.stringify(newConfig));
         }
         if (!newConfig) {
-          localStorage.removeItem('firebaseConfig');
+            localStorage.removeItem('firebaseConfig');
         }
     };
     
-    useEffect(() => {
-        if(!config) {
-            const newData = generateMockData();
-            setOriginalData(newData);
-            setData(newData);
-        }
-    }, [config]);
-
     const testConnection = async () => {
         if (!config) return { firebase: false, device: false, web: true };
         await new Promise(res => setTimeout(res, 1000));
         const success = Object.values(config).every(val => val && val.length > 5);
         return { firebase: success, device: success, web: true };
     };
-    
+
+    const setUpdateMode = (mode: UpdateMode) => {
+        setUpdateModeState(mode);
+        // If switching from manual mode and an update is available, trigger it
+        if (isUpdateAvailable && mode !== 'manual') {
+            if (mode === 'realtime') {
+                fetchLatestData();
+            } else if (mode === 'delayed') {
+                setTimeout(fetchLatestData, 3000);
+            }
+        }
+    };
+
+    const fetchLatestData = useCallback(() => {
+        setClientData(serverData);
+        setIsUpdateAvailable(false);
+    }, [serverData]);
+
     const updateMockData = useCallback((updates: Partial<MockData>) => {
-        setData(prevData => {
+        setServerData(prevData => {
             const newData = { ...prevData, ...updates };
             if (updates.spots || updates.sessions) {
-                 const currentSpots = updates.spots || prevData.spots;
-                 const newOccupied = currentSpots.filter(s => s.occupied).length;
-                 const newTotal = currentSpots.length;
-                 newData.summary = {
-                     occupied: newOccupied,
-                     total: newTotal,
-                     occupancyPercent: newTotal > 0 ? (newOccupied / newTotal) * 100 : 0,
-                 };
+                const currentSpots = updates.spots || prevData.spots;
+                const newOccupied = currentSpots.filter(s => s.occupied).length;
+                const newTotal = currentSpots.length;
+                newData.summary = {
+                    occupied: newOccupied,
+                    total: newTotal,
+                    occupancyPercent: newTotal > 0 ? (newOccupied / newTotal) * 100 : 0,
+                };
             }
             return newData;
         });
     }, []);
 
     const resetMockData = useCallback(() => {
-        setData(originalData);
+        setServerData(originalData);
+        setClientData(originalData);
+        setIsUpdateAvailable(false);
     }, [originalData]);
 
+    const contextValue = {
+        isConfigured: !!config,
+        config,
+        setConfig,
+        data: clientData,
+        loading,
+        error,
+        testConnection,
+        updateMockData,
+        resetMockData,
+        updateMode,
+        setUpdateMode,
+        isUpdateAvailable,
+        fetchLatestData
+    };
 
     return (
-        <FirebaseContext.Provider value={{ isConfigured: !!config, config, setConfig, data, loading, error, testConnection, updateMockData, resetMockData }}>
+        <FirebaseContext.Provider value={contextValue}>
             {children}
         </FirebaseContext.Provider>
     );
 };
+
+
+const CameraProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+    const [camInUrl, setCamInUrl] = useState(() => localStorage.getItem('camInUrl') || 'http://192.168.1.80/capture');
+    const [camOutUrl, setCamOutUrl] = useState(() => localStorage.getItem('camOutUrl') || 'http://192.168.1.81/capture');
+
+    useEffect(() => {
+        localStorage.setItem('camInUrl', camInUrl);
+    }, [camInUrl]);
+
+    useEffect(() => {
+        localStorage.setItem('camOutUrl', camOutUrl);
+    }, [camOutUrl]);
+
+    const value = { camInUrl, camOutUrl, setCamInUrl, setCamOutUrl };
+
+    return <CameraContext.Provider value={value}>{children}</CameraContext.Provider>;
+};
+
 
 // --- UI COMPONENTS ---
 const Card: React.FC<{ children: React.ReactNode, className?: string }> = ({ children, className }) => (
@@ -346,6 +456,25 @@ const Modal: React.FC<{ isOpen: boolean, onClose: () => void, title: string, chi
     );
 };
 
+const UpdateNotification: React.FC = () => {
+    const { isUpdateAvailable, fetchLatestData } = useFirebase();
+
+    if (!isUpdateAvailable) return null;
+
+    return (
+        <div className="bg-amber-400 dark:bg-amber-500 text-black p-2 text-center text-sm z-30 flex justify-center items-center gap-4">
+            <span>Có bản cập nhật mới từ Admin.</span>
+            <button 
+                onClick={fetchLatestData}
+                className="bg-white/80 dark:bg-zinc-800/80 px-3 py-1 rounded-md font-semibold text-xs hover:bg-white dark:hover:bg-zinc-700 shadow-md flex items-center gap-1"
+            >
+                <RefreshIcon className="w-4 h-4" />
+                Tải cập nhật
+            </button>
+        </div>
+    );
+};
+
 // --- LAYOUT COMPONENTS ---
 const NAV_ITEMS = [
     { path: '/', label: 'Trang chủ', icon: HomeIcon, admin: false, demoAdminOnly: false },
@@ -361,13 +490,15 @@ const NAV_ITEMS = [
 const TopHeader: React.FC = () => {
     const { theme, toggleTheme, viewMode, toggleViewMode, toggleMobileMenu } = useUI();
     const { user, logout } = useAuth();
+    const { fetchLatestData } = useFirebase();
+
     return (
-        <header className="bg-white dark:bg-dark-card shadow-md p-2 flex justify-between items-center flex-shrink-0 z-30">
+        <header className="bg-white dark:bg-dark-card shadow-md p-2 flex justify-between items-center flex-shrink-0 z-20">
             <h1 className="text-lg font-bold text-primary px-4 hidden md:block">Hệ Thống Quản Lý Bãi Đỗ Xe Thông Minh</h1>
             <h1 className="text-lg font-bold text-primary px-2 md:hidden">Bãi Xe T.Minh</h1>
             <div className="flex items-center gap-1">
                  <span className="text-sm hidden sm:flex items-center gap-1 text-gray-600 dark:text-gray-400"><MonitorIcon className="w-4 h-4" /> Device</span>
-                 <button className="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-zinc-700"><RefreshIcon className="w-5 h-5 text-gray-600 dark:text-gray-300" /></button>
+                 <button onClick={fetchLatestData} className="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-zinc-700" title="Tải dữ liệu mới nhất"><RefreshIcon className="w-5 h-5 text-gray-600 dark:text-gray-300" /></button>
                 <button onClick={toggleViewMode} className="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-zinc-700">
                     {viewMode === 'web' ? <SmartphoneIcon className="w-5 h-5 text-gray-600 dark:text-gray-300"/> : <MonitorIcon className="w-5 h-5 text-gray-600 dark:text-gray-300"/>}
                 </button>
@@ -391,11 +522,21 @@ const TopHeader: React.FC = () => {
 
 const ContentHeader: React.FC = () => {
     const location = useLocation();
-    const currentRoute = NAV_ITEMS.find(item => item.path === location.pathname);
+    let currentLabel = 'Bảng điều khiển';
+    
+    if (location.pathname === '/camera') {
+        currentLabel = 'Xem Camera';
+    } else {
+        const currentRoute = NAV_ITEMS.find(item => item.path === location.pathname);
+        if(currentRoute) {
+            currentLabel = currentRoute.label;
+        }
+    }
+
     return (
       <div className="bg-white dark:bg-dark-card p-4 flex-shrink-0 border-b border-gray-200 dark:border-zinc-700">
         <h2 className="text-xl font-bold text-gray-800 dark:text-dark-text">
-            Bãi Xe Thông Minh {currentRoute && `- ${currentRoute.label}`}
+            Bãi Xe Thông Minh - {currentLabel}
         </h2>
       </div>
     );
@@ -471,6 +612,7 @@ const MobileSidebar: React.FC = () => {
 
 const WebLayout: React.FC<{ children: React.ReactNode }> = ({ children }) => (
      <div className="flex flex-col h-screen bg-gray-100 dark:bg-dark-bg text-gray-800 dark:text-dark-text">
+        <UpdateNotification />
         <TopHeader /> 
         <div className="flex flex-1 overflow-hidden">
             <Sidebar />
@@ -486,6 +628,7 @@ const WebLayout: React.FC<{ children: React.ReactNode }> = ({ children }) => (
 
 const MobileLayout: React.FC<{ children: React.ReactNode }> = ({ children }) => (
     <div className="flex flex-col h-screen bg-gray-100 dark:bg-dark-bg text-gray-800 dark:text-dark-text overflow-hidden">
+        <UpdateNotification />
         <TopHeader />
         <main className="p-4 flex-1 overflow-y-auto">
             {children}
@@ -525,6 +668,93 @@ const DemoProtectedRoute: React.FC<{ children: React.ReactNode }> = ({ children 
     return <>{children}</>;
 };
 
+const CameraTile: React.FC<{ title: string; url: string; intervalMs?: number, imageClassName?: string }> = ({ title, url, intervalMs = 2000, imageClassName }) => {
+    const [src, setSrc] = useState('');
+    const [error, setError] = useState(false);
+
+    useEffect(() => {
+        // Function to update the source and handle errors
+        const updateImage = () => {
+            // Add a timestamp to prevent caching
+            const newSrc = `${url}?ts=${Date.now()}`;
+            
+            const img = new Image();
+            img.src = newSrc;
+            
+            img.onload = () => {
+                setSrc(newSrc);
+                setError(false);
+            };
+            
+            img.onerror = () => {
+                setError(true);
+            };
+        };
+
+        // Initial load
+        updateImage();
+
+        // Set up the interval
+        const intervalId = setInterval(updateImage, intervalMs);
+
+        // Clean up the interval on component unmount
+        return () => clearInterval(intervalId);
+    }, [url, intervalMs]);
+
+    return (
+        <Card>
+            <h3 className="font-bold mb-2 text-center">{title}</h3>
+            <div className="bg-black rounded-md flex items-center justify-center" style={{ height: imageClassName?.includes('h-80') ? '20rem' : '12rem' }}>
+                {error ? (
+                    <div className="text-center text-red-500 p-4">
+                        <AlertTriangleIcon className="w-8 h-8 mx-auto mb-2"/>
+                        <p className="font-semibold">Lỗi kết nối</p>
+                        <p className="text-xs">Không thể tải ảnh từ camera.</p>
+                    </div>
+                ) : src ? (
+                    <img src={src} alt={title} className={imageClassName || "w-full h-48 object-contain rounded-md"} />
+                ) : (
+                    <div className="text-center text-gray-400">
+                        <p>Đang tải...</p>
+                    </div>
+                )}
+            </div>
+        </Card>
+    );
+};
+
+const CameraIPSettings: React.FC = () => {
+    const { camInUrl, camOutUrl, setCamInUrl, setCamOutUrl } = useCamera();
+    return (
+        <Card>
+            <h3 className="font-bold mb-2">Dán IP Camera</h3>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                    <label htmlFor="cam-in-url" className="text-sm font-medium text-gray-700 dark:text-gray-300">Cổng vào</label>
+                    <input
+                        id="cam-in-url"
+                        type="text"
+                        value={camInUrl}
+                        onChange={(e) => setCamInUrl(e.target.value)}
+                        placeholder="http://..."
+                        className="w-full mt-1 p-2 border rounded-md dark:bg-zinc-700 dark:border-zinc-600"
+                    />
+                </div>
+                <div>
+                    <label htmlFor="cam-out-url" className="text-sm font-medium text-gray-700 dark:text-gray-300">Cổng ra</label>
+                    <input
+                         id="cam-out-url"
+                        type="text"
+                        value={camOutUrl}
+                        onChange={(e) => setCamOutUrl(e.target.value)}
+                        placeholder="http://..."
+                        className="w-full mt-1 p-2 border rounded-md dark:bg-zinc-700 dark:border-zinc-600"
+                    />
+                </div>
+            </div>
+        </Card>
+    );
+};
 
 // --- PAGES ---
 
@@ -645,16 +875,30 @@ const DashboardPage: React.FC = () => {
 
 const RealtimePage: React.FC = () => {
     const { data } = useFirebase();
+    const { camInUrl, camOutUrl } = useCamera();
     const openSessions = useMemo(() => data.sessions.filter(s => s.status === 'open').sort((a,b) => b.inAt - a.inAt), [data.sessions]);
 
     return (
         <div className="space-y-4">
-            <div className="flex justify-between items-center">
+            <div className="flex justify-between items-center flex-wrap gap-2">
                 <h2 className="text-2xl font-bold">Xe trong bãi</h2>
-                <div className="text-lg font-semibold bg-blue-100 dark:bg-blue-900/50 text-primary px-3 py-1 rounded-full">
-                    Số xe đang đỗ: {openSessions.length}
+                <div className="flex items-center gap-2">
+                    <div className="text-lg font-semibold bg-blue-100 dark:bg-blue-900/50 text-primary px-3 py-1 rounded-full">
+                        Số xe: {openSessions.length}
+                    </div>
+                    <Link to="/camera">
+                        <Button>Xem Camera</Button>
+                    </Link>
                 </div>
             </div>
+
+            <CameraIPSettings />
+            
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <CameraTile title="Cổng Vào - ESP32-CAM" url={camInUrl} />
+              <CameraTile title="Cổng Ra - ESP32-CAM" url={camOutUrl} />
+            </div>
+
             <div className="space-y-3">
                 {openSessions.length > 0 ? openSessions.map(session => (
                     <Card key={session.id} className="flex items-center gap-4">
@@ -670,6 +914,35 @@ const RealtimePage: React.FC = () => {
                         <p className="text-center text-gray-500">Không có xe nào trong bãi.</p>
                     </Card>
                 )}
+            </div>
+        </div>
+    );
+};
+
+const CameraPage: React.FC = () => {
+    const { camInUrl, camOutUrl } = useCamera();
+    return (
+        <div className="space-y-4">
+            <div className="flex justify-between items-center">
+                <h2 className="text-2xl font-bold">Xem Camera</h2>
+                <Link to="/realtime">
+                    <Button variant="ghost">
+                        &larr; Về Trang Trong Bãi
+                    </Button>
+                </Link>
+            </div>
+            <CameraIPSettings />
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <CameraTile 
+                    title="Cổng Vào - ESP32-CAM" 
+                    url={camInUrl} 
+                    imageClassName="w-full h-80 object-contain rounded-md"
+                />
+                <CameraTile 
+                    title="Cổng Ra - ESP32-CAM" 
+                    url={camOutUrl}
+                    imageClassName="w-full h-80 object-contain rounded-md"
+                />
             </div>
         </div>
     );
@@ -1064,7 +1337,7 @@ const ImagePasteTarget: React.FC<{onPaste: (base64: string) => void, imageUrl: s
 };
 
 const DemoPage: React.FC = () => {
-    const { data, updateMockData, resetMockData } = useFirebase();
+    const { data, updateMockData, resetMockData, updateMode, setUpdateMode } = useFirebase();
     const [initialData] = useState(() => JSON.parse(JSON.stringify(data)));
     
     const [demoChanges, setDemoChanges] = useState({
@@ -1212,6 +1485,25 @@ const DemoPage: React.FC = () => {
                     <Button onClick={handleFullReset} variant='danger'><RefreshIcon className="w-5 h-5" /> Reset Toàn bộ</Button>
                 </div>
             </div>
+
+            <Card>
+                <h3 className="font-bold">Chế độ Cập nhật cho Viewer</h3>
+                <p className="text-sm text-gray-500 mt-1 mb-3">Chọn cách viewer nhận được thay đổi bạn thực hiện ở đây.</p>
+                <div className="flex flex-col sm:flex-row gap-x-6 gap-y-2">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                        <input type="radio" name="updateMode" value="realtime" checked={updateMode === 'realtime'} onChange={() => setUpdateMode('realtime')} className="h-4 w-4 text-primary focus:ring-primary border-gray-300"/>
+                        <span>Real-time (Tức thì)</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                        <input type="radio" name="updateMode" value="delayed" checked={updateMode === 'delayed'} onChange={() => setUpdateMode('delayed')} className="h-4 w-4 text-primary focus:ring-primary border-gray-300"/>
+                        <span>Delayed (Trễ 3 giây)</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                        <input type="radio" name="updateMode" value="manual" checked={updateMode === 'manual'} onChange={() => setUpdateMode('manual')} className="h-4 w-4 text-primary focus:ring-primary border-gray-300"/>
+                        <span>Manual (Thủ công)</span>
+                    </label>
+                </div>
+            </Card>
             
             <Card>
                 <h3 className="font-bold">Số lượng xe trong bãi</h3>
@@ -1455,13 +1747,14 @@ const AppRoutes = () => (
     <Routes>
         <Route path="/" element={<DashboardPage />} />
         <Route path="/realtime" element={<RealtimePage />} />
+        <Route path="/camera" element={<CameraPage />} />
         <Route path="/history" element={<HistoryPage />} />
         <Route path="/charts" element={<ChartsPage />} />
         <Route path="/search" element={<SearchPage />} />
         <Route path="/connect" element={<ConnectPage />} />
         <Route path="/login" element={<LoginPage />} />
         <Route path="/settings" element={<ProtectedRoute><SettingsPage /></ProtectedRoute>} />
-        <Route path="/demo" element={<DemoProtectedRoute><DemoPage /></DemoProtectedRoute>} />
+        <Route path="/demo" element={<DemoProtectedRoute><DemoPage /></ProtectedRoute>} />
         <Route path="*" element={<NotFoundPage />} />
     </Routes>
 );
@@ -1477,9 +1770,11 @@ export default function App() {
         <UIProvider>
             <AuthProvider>
                 <FirebaseProvider>
-                    <HashRouter>
-                        <MainLayout />
-                    </HashRouter>
+                    <CameraProvider>
+                        <HashRouter>
+                            <MainLayout />
+                        </HashRouter>
+                    </CameraProvider>
                 </FirebaseProvider>
             </AuthProvider>
         </UIProvider>
